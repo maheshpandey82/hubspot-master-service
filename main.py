@@ -1,117 +1,81 @@
-import os
-import requests
-from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Depends
+from pydantic import BaseModel, Field
+from service import JobService, ExtractionService, JobStatus
+from normalizer import NormalizationService
+from utils import deep_serialize
+from auth import hmac_auth_required
+from minio_client import MinIOStorageClient
+from dlq import DeadLetterQueue
 
-# .env file se environment variables load karein
-load_dotenv()
+app = FastAPI(title="HubSpot Master Service", version="1.0.0")
 
-HUBSPOT_ACCESS_TOKEN = os.getenv("HUBSPOT_ACCESS_TOKEN")
-BASE_URL = "https://api.hubapi.com/crm/v3/objects/contacts"
 
-HEADERS = {
-    "Authorization": f"Bearer {HUBSPOT_ACCESS_TOKEN}",
-    "Content-Type": "application/json"
-}
+class ScanStartRequest(BaseModel):
+    organization_id: str
+    object_types: list[str] = Field(default=["contacts", "companies", "deals", "tickets", "owners"])
 
-# 1. Pagination: Saare Contacts Fetch Karna Cursor Ke Saath
-def fetch_all_contacts():
-    print("--- 1. Fetching All Contacts (With Pagination & Properties) ---")
-    all_contacts = []
-    after = None
+
+@app.get("/api/health")
+def health_check():
+    return {"status": "healthy", "service": "hubspot-master-service"}
+
+
+# Secure Endpoints using HMAC Auth Dependency
+@app.post("/api/scan/start", status_code=202, dependencies=[Depends(hmac_auth_required)])
+def start_scan(request: ScanStartRequest):
+    job = ExtractionService.start_scan(request.organization_id, request.object_types)
+    return {"message": "Scan started successfully", "scan_id": job["id"], "status": job["status"]}
+
+
+@app.get("/api/scan/{scan_id}/status", dependencies=[Depends(hmac_auth_required)])
+def get_scan_status(scan_id: str):
+    job = JobService.get_job(scan_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Scan ID not found")
+    return deep_serialize(job)
+
+
+@app.post("/api/scan/{scan_id}/pause", dependencies=[Depends(hmac_auth_required)])
+def pause_scan(scan_id: str):
+    job = JobService.get_job(scan_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Scan ID not found")
+    if job["status"] not in [JobStatus.RUNNING, JobStatus.PENDING]:
+        raise HTTPException(status_code=400, detail=f"Cannot pause job in state {job['status']}")
     
-    # Custom properties jo hume chahiye
-    params = {
-        "limit": 10,
-        "properties": ["firstname", "lastname", "email", "phone", "company"]
+    JobService.update_status(scan_id, JobStatus.PAUSED)
+    return {"message": "Scan pause requested", "scan_id": scan_id}
+
+
+@app.post("/api/scan/{scan_id}/resume", dependencies=[Depends(hmac_auth_required)])
+def resume_scan(scan_id: str):
+    job = JobService.get_job(scan_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Scan ID not found")
+    if job["status"] not in [JobStatus.PAUSED, JobStatus.CRASHED]:
+        raise HTTPException(status_code=400, detail=f"Cannot resume job in state {job['status']}")
+    
+    JobService.update_status(scan_id, JobStatus.RESUMING)
+    return {"message": "Scan resuming", "scan_id": scan_id}
+
+
+@app.post("/api/scan/{scan_id}/cancel", dependencies=[Depends(hmac_auth_required)])
+def cancel_scan(scan_id: str):
+    job = JobService.get_job(scan_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Scan ID not found")
+    
+    JobService.update_status(scan_id, JobStatus.CANCELLED)
+    return {"message": "Scan cancelled", "scan_id": scan_id}
+
+
+@app.get("/api/normalization/supported-objects", dependencies=[Depends(hmac_auth_required)])
+def get_supported_objects():
+    return {
+        "supported_objects": list(NormalizationService.NORMALIZERS.keys())
     }
 
-    try:
-        while True:
-            if after:
-                params["after"] = after
 
-            response = requests.get(BASE_URL, headers=HEADERS, params=params)
-            
-            # Error handling (Rate limits / HTTP errors)
-            if response.status_code == 429:
-                print("❌ Rate limit exceeded (429). Please wait a moment.")
-                break
-            elif response.status_code != 200:
-                print(f"❌ Failed to fetch contacts: {response.status_code} - {response.text}")
-                break
-
-            data = response.json()
-            results = data.get("results", [])
-            all_contacts.extend(results)
-
-            # Pagination check
-            paging = data.get("paging", {})
-            next_page = paging.get("next", {})
-            after = next_page.get("after")
-
-            if not after:
-                break
-
-        print(f"✅ Total Contacts Retrieved: {len(all_contacts)}")
-        for contact in all_contacts:
-            props = contact.get("properties", {})
-            print(f"- ID: {contact.get('id')} | Name: {props.get('firstname')} {props.get('lastname')} | Email: {props.get('email')}")
-        
-        return all_contacts
-
-    except Exception as e:
-        print(f"❌ Error occurred: {e}")
-        return []
-
-# 2. POST Request: Naya Contact Create Karna
-def create_contact(email, firstname, lastname):
-    print("\n--- 2. Creating New Contact ---")
-    payload = {
-        "properties": {
-            "email": email,
-            "firstname": firstname,
-            "lastname": lastname
-        }
-    }
-    try:
-        response = requests.post(BASE_URL, headers=HEADERS, json=payload)
-        if response.status_code == 201:
-            contact = response.json()
-            print(f"✅ Contact Created Successfully! ID: {contact.get('id')}")
-            return contact.get("id")
-        elif response.status_code == 409:
-            print("⚠️ Contact with this email already exists.")
-        else:
-            print(f"❌ Failed to create contact: {response.status_code} - {response.text}")
-    except Exception as e:
-        print(f"❌ Error occurred: {e}")
-    return None
-
-# 3. PATCH Request: Existing Contact Update Karna
-def update_contact(contact_id, phone_number):
-    print(f"\n--- 3. Updating Contact (ID: {contact_id}) ---")
-    url = f"{BASE_URL}/{contact_id}"
-    payload = {
-        "properties": {
-            "phone": phone_number
-        }
-    }
-    try:
-        response = requests.patch(url, headers=HEADERS, json=payload)
-        if response.status_code == 200:
-            print("✅ Contact Updated Successfully!")
-        else:
-            print(f"❌ Failed to update contact: {response.status_code} - {response.text}")
-    except Exception as e:
-        print(f"❌ Error occurred: {e}")
-
-if __name__ == "__main__":
-    # Test 1: Saare contacts fetch karna
-    contacts = fetch_all_contacts()
-    
-    # Test 2: Dummy Contact Create Karna (Aap email change kar sakte hain)
-    new_id = create_contact("test.user2@example.com", "Test", "User")
-    
-    # Test 3: Agar contact create hua toh use update karna
-    if new_id:
-        update_contact(new_id, "9876543210")
+@app.get("/api/dlq/records", dependencies=[Depends(hmac_auth_required)])
+def get_dlq_records():
+    return {"dlq_records": DeadLetterQueue.get_all_dlq_records()}
